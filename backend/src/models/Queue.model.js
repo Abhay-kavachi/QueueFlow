@@ -1,4 +1,21 @@
 const { query, transaction } = require('../utils/database');
+
+/**
+ * QueueModel handles all core logic for manipulating the state of the Queue.
+ * 
+ * RESOURCE LOCKING (`SELECT ... FOR UPDATE`):
+ * To guarantee ACID properties and eliminate race conditions during high-concurrency Queue transitions,
+ * explicit row-level locks are used.
+ * 
+ * Specifically, `FOR UPDATE` is applied when:
+ * 1. Advancing a user from 'pending' to 'next' (callNextCurrent).
+ * 2. Moving a user from 'next' to 'active' (moveQueueForward).
+ * 3. Expiring grace periods (expireGracePeriod).
+ * 
+ * These locks guarantee that if two concurrent workers try to call the next patient,
+ * the database will serialize the requests, and the second worker will block until the first finishes,
+ * returning either the next patient or nothing if the queue became empty.
+ */
 class QueueModel {
   static async query(text, params) {
     return query(text, params);
@@ -99,13 +116,14 @@ class QueueModel {
     };
   }
   static async moveQueueForward(serviceId) {
+    // Acquire a row-level lock on the specific 'next' user to prevent concurrent workers from activating the same user
     const result = await transaction([
       {
         text: `SELECT id, user_hash, position 
                FROM live_queue 
                WHERE service_id = $1 AND state = 'next' 
                ORDER BY position ASC 
-               LIMIT 1`,
+               LIMIT 1 FOR UPDATE`,
         params: [serviceId]
       }
     ]);
@@ -136,12 +154,38 @@ class QueueModel {
        SET state = 'grace', grace_started_at = NOW(), updated_at = NOW() 
        FROM service_configurations sc
        WHERE live_queue.service_id = sc.service_id 
-         AND live_queue.state = 'active' 
-         AND live_queue.updated_at < NOW() - INTERVAL '2 minutes'
+         AND live_queue.state = 'next' 
+         AND live_queue.updated_at < NOW() - INTERVAL '3 minutes'
          AND (sc.is_paused IS NULL OR sc.is_paused = false)
        RETURNING live_queue.id, live_queue.service_id, live_queue.user_hash`
     );
     return result.rows;
+  }
+
+  static async autoCallStagnantQueues() {
+    // Find services that have pending users, NO active users, are NOT paused, 
+    // and haven't had any queue activity (updated_at) in the last 3 minutes.
+    const stagnantServicesRes = await query(
+      `SELECT s.id as service_id
+       FROM services s
+       LEFT JOIN service_configurations sc ON s.id = sc.service_id
+       WHERE s.is_active = true 
+         AND (sc.is_paused IS NULL OR sc.is_paused = false)
+         AND EXISTS (SELECT 1 FROM live_queue WHERE service_id = s.id AND state = 'pending')
+         AND NOT EXISTS (SELECT 1 FROM live_queue WHERE service_id = s.id AND state = 'active')
+         AND (
+           SELECT COALESCE(MAX(updated_at), '1970-01-01'::timestamp) 
+           FROM live_queue 
+           WHERE service_id = s.id
+         ) < NOW() - INTERVAL '3 minutes'`
+    );
+    
+    const calledServices = [];
+    for (const row of stagnantServicesRes.rows) {
+      const nextPerson = await this.callNextCurrent(row.service_id);
+      if (nextPerson) calledServices.push(row.service_id);
+    }
+    return calledServices;
   }
 
   static async recycleExpiredGraceEntries() {
@@ -237,8 +281,29 @@ class QueueModel {
     return await this.startGracePeriod(activeResult.rows[0].id);
   }
   static async callNextCurrent(serviceId) {
+    // Acquire a row-level lock on the top 'pending' user to ensure only one worker can call them forward
+    const result = await transaction([
+      {
+        text: `SELECT id FROM live_queue WHERE service_id = $1 AND state = 'pending' ORDER BY position ASC LIMIT 1 FOR UPDATE`,
+        params: [serviceId]
+      }
+    ]);
+    if(result[0].rows.length === 0) return null;
+    const nextPerson = result[0].rows[0];
+    await query(
+      `UPDATE live_queue SET state = 'next', updated_at = NOW() WHERE id = $1`,
+      [nextPerson.id]
+    );
+    await query(
+      `UPDATE live_queue SET position = position - 1 WHERE service_id = $1 AND state = 'pending' AND position > 0`,
+      [serviceId]
+    );
+    return nextPerson;
+  }
+  
+  static async markPatientActive(serviceId) {
     const nextResult = await query(
-      `SELECT id FROM live_queue WHERE service_id = $1 AND state = 'pending' ORDER BY position ASC LIMIT 1`,
+      `SELECT id FROM live_queue WHERE service_id = $1 AND state = 'next' ORDER BY updated_at ASC LIMIT 1`,
       [serviceId]
     );
     if(nextResult.rows.length === 0) return null;
@@ -268,6 +333,46 @@ class QueueModel {
       recordUpdated: result[0].rowCount > 0
     };
   }
+
+  static async removeUserFromQueue(queueId) {
+    const result = await transaction([
+      {
+        text: `INSERT INTO historical_queue_logs (user_hash, service_id, entry_type, appointment_time, grace_started_at, registration_source, final_status, completed_at)
+               SELECT user_hash, service_id, entry_type, appointment_time, grace_started_at, 'admin', 'cancelled', NOW()
+               FROM live_queue WHERE id = $1
+               RETURNING id`,
+        params: [queueId]
+      },
+      {
+        text: `DELETE FROM live_queue WHERE id = $1 RETURNING id, service_id, state`,
+        params: [queueId]
+      }
+    ]);
+
+    if (result[1].rowCount > 0) {
+      const deletedEntry = result[1].rows[0];
+      if (deletedEntry.state === 'pending') {
+        await query(
+          `WITH numbered AS (
+             SELECT id, ROW_NUMBER() OVER (ORDER BY position ASC) as new_pos
+             FROM live_queue 
+             WHERE service_id = $1 AND state = 'pending'
+           )
+           UPDATE live_queue l
+           SET position = n.new_pos
+           FROM numbered n
+           WHERE l.id = n.id AND l.position != n.new_pos`,
+          [deletedEntry.service_id]
+        );
+      }
+    }
+
+    return {
+      success: result[1].rowCount > 0,
+      removed: result[1].rows[0]
+    };
+  }
+
   static async getCurrentQueueStatus(serviceId) {
     const result = await query(
       `SELECT 

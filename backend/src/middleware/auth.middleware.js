@@ -20,6 +20,8 @@ function authenticateUser(req, res, next) {
         userHash: verificationResult.userHash,
         sessionId: verificationResult.sessionId
       };
+      req.tenantId = verificationResult.tenantId;
+      req.roleId = verificationResult.roleId;
       next();
     })
     .catch(error => {
@@ -48,6 +50,8 @@ function authenticateStaff(req, res, next) {
         });
       }
       req.staff = verificationResult.admin;
+      req.tenantId = verificationResult.admin.organizationId;
+      req.roleId = verificationResult.admin.role;
       next();
     })
     .catch(error => {
@@ -81,6 +85,8 @@ function authenticateWorker(req, res, next) {
         });
       }
       req.worker = verificationResult.admin;
+      req.tenantId = verificationResult.admin.organizationId;
+      req.roleId = verificationResult.admin.role;
       next();
     })
     .catch(error => {

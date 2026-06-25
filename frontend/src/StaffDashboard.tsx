@@ -3,6 +3,7 @@ import axios from 'axios';
 interface QueueEntry {
   id: string;
   user_hash: string;
+  user_name?: string;
   position: number;
   state: 'pending' | 'next' | 'active' | 'grace' | 'appointment' | 'completed' | 'expired' | 'walk_in' | string;
   entry_type?: 'walk_in' | 'appointment';
@@ -106,6 +107,25 @@ function StaffDashboard() {
       fetchAnalyticsData();
     }
   }, [activeTab, selectedService]);
+  const currentEntry = queueData.find(q => q.state === 'active' || q.state === 'next' || q.state === 'pending');
+  const markActive = async () => {
+    if (!selectedService || !currentEntry) return;
+    setIsLoading(true);
+    try {
+      const token = localStorage.getItem('token');
+      await axios.post(
+        `/api/staff/mark-active/${selectedService}`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      await fetchQueueData();
+    } catch (err: any) {
+      setMessage(err.response?.data?.error || 'Failed to mark patient active');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const completeService = async () => {
     if (!staffToken) return;
     setIsLoading(true);
@@ -333,19 +353,28 @@ function StaffDashboard() {
                     ))}
                   </select>
                 </div>
-                <div className="flex gap-2 flex-wrap">
+                <div className="flex flex-wrap gap-2 justify-center">
                   <button onClick={() => fetchQueueData()} disabled={isLoading} className={`btn btn-primary ${isLoading ? 'opacity-50' : ''}`}>
                     Refresh
                   </button>
                   <button onClick={callNext} disabled={isLoading} className={`btn bg-blue-600 hover:bg-blue-700 text-white ${isLoading ? 'opacity-50' : ''}`}>
-                    Call Next
+                    Call Next Patient
                   </button>
-                  <button onClick={markNoShow} disabled={isLoading} className={`btn bg-orange-500 hover:bg-orange-600 text-white ${isLoading ? 'opacity-50' : ''}`}>
-                    No Show (Grace)
-                  </button>
-                  <button onClick={completeService} disabled={isLoading} className={`btn bg-purple-600 hover:bg-purple-700 text-white ${isLoading ? 'opacity-50' : ''}`}>
-                    Complete Active
-                  </button>
+                  {currentEntry?.state === 'next' && (
+                    <button onClick={markActive} disabled={isLoading} className={`btn bg-green-600 hover:bg-green-700 text-white ${isLoading ? 'opacity-50' : ''}`}>
+                      Patient Arrived
+                    </button>
+                  )}
+                  {currentEntry?.state === 'active' && (
+                    <button onClick={completeService} disabled={isLoading} className={`btn bg-purple-600 hover:bg-purple-700 text-white ${isLoading ? 'opacity-50' : ''}`}>
+                      Complete Current
+                    </button>
+                  )}
+                  {(currentEntry?.state === 'active' || currentEntry?.state === 'next') && (
+                    <button onClick={markNoShow} disabled={isLoading} className={`btn bg-orange-500 hover:bg-orange-600 text-white ${isLoading ? 'opacity-50' : ''}`}>
+                      Send to Grace
+                    </button>
+                  )}
                   <button onClick={() => pauseService(true)} disabled={isLoading} className={`btn bg-yellow-600 hover:bg-yellow-700 text-white ${isLoading ? 'opacity-50' : ''}`}>
                     Pause
                   </button>
@@ -360,7 +389,7 @@ function StaffDashboard() {
                     <tr className="bg-gray-50 border-b border-gray-200">
                       <th className="p-3 text-xs font-medium text-gray-500 uppercase">Position</th>
                       <th className="p-3 text-xs font-medium text-gray-500 uppercase">State</th>
-                      <th className="p-3 text-xs font-medium text-gray-500 uppercase">User Hash</th>
+                      <th className="p-3 text-xs font-medium text-gray-500 uppercase">Patient Name</th>
                       <th className="p-3 text-xs font-medium text-gray-500 uppercase">Time Joined</th>
                       <th className="p-3 text-xs font-medium text-gray-500 uppercase">Actions</th>
                     </tr>
@@ -390,22 +419,44 @@ function StaffDashboard() {
                               }
                            })()}
                         </td>
-                        <td className="p-3 whitespace-nowrap text-sm text-gray-500">{entry.user_hash.substring(0, 8)}...</td>
+                        <td className="p-3 whitespace-nowrap text-sm text-gray-500">
+                          {entry.user_name ? (
+                            <span className="font-semibold text-gray-700">{entry.user_name}</span>
+                          ) : (
+                            `${entry.user_hash.substring(0, 8)}...`
+                          )}
+                        </td>
                         <td className="p-3 whitespace-nowrap text-sm text-gray-500">{new Date(entry.created_at).toLocaleTimeString()}</td>
                         <td className="p-3 whitespace-nowrap">
-                           <button 
-                             onClick={async () => {
-                               try {
-                                 await axios.post(`http://localhost:3001/api/staff/grace/${entry.id}`, {}, { headers: { Authorization: `Bearer ${staffToken}` }});
-                                 fetchQueueData();
-                               } catch(e: any) {
-                                 setMessage(e.response?.data?.error || 'Failed to move user');
-                               }
-                             }} 
-                             className="text-xs bg-orange-100 text-orange-700 px-3 py-1 rounded hover:bg-orange-200 font-semibold transition-colors"
-                           >
-                             Send to Grace
-                           </button>
+                           <div className="flex gap-2">
+                             <button 
+                               onClick={async () => {
+                                 try {
+                                   await axios.post(`http://localhost:3001/api/staff/grace/${entry.id}`, {}, { headers: { Authorization: `Bearer ${staffToken}` }});
+                                   fetchQueueData();
+                                 } catch(e: any) {
+                                   setMessage(e.response?.data?.error || 'Failed to move user');
+                                 }
+                               }} 
+                               className="text-xs bg-orange-100 text-orange-700 px-3 py-1 rounded hover:bg-orange-200 font-semibold transition-colors"
+                             >
+                               Send to Grace
+                             </button>
+                             <button
+                               onClick={async () => {
+                                 if (!window.confirm('Are you sure you want to remove this user from the queue?')) return;
+                                 try {
+                                   await axios.delete(`http://localhost:3001/api/staff/remove/${entry.id}`, { headers: { Authorization: `Bearer ${staffToken}` }});
+                                   fetchQueueData();
+                                 } catch(e: any) {
+                                   setMessage(e.response?.data?.error || 'Failed to remove user');
+                                 }
+                               }}
+                               className="text-xs bg-red-100 text-red-700 px-3 py-1 rounded hover:bg-red-200 font-semibold transition-colors"
+                             >
+                               Remove
+                             </button>
+                           </div>
                         </td>
                       </tr>
                     ))}
@@ -426,7 +477,7 @@ function StaffDashboard() {
                     <thead>
                       <tr className="bg-orange-50 border-b border-orange-200">
                         <th className="p-3 text-xs font-medium text-orange-800 uppercase">Original Pos</th>
-                        <th className="p-3 text-xs font-medium text-orange-800 uppercase">User Hash</th>
+                        <th className="p-3 text-xs font-medium text-orange-800 uppercase">Patient Name</th>
                         <th className="p-3 text-xs font-medium text-orange-800 uppercase">Joined</th>
                         <th className="p-3 text-xs font-medium text-orange-800 uppercase">Actions</th>
                       </tr>
@@ -439,7 +490,13 @@ function StaffDashboard() {
                               #{entry.position}
                             </span>
                           </td>
-                          <td className="p-3 whitespace-nowrap text-sm text-gray-600">{entry.user_hash.substring(0, 8)}...</td>
+                          <td className="p-3 whitespace-nowrap text-sm text-gray-600">
+                            {entry.user_name ? (
+                              <span className="font-semibold text-gray-700">{entry.user_name}</span>
+                            ) : (
+                              `${entry.user_hash.substring(0, 8)}...`
+                            )}
+                          </td>
                           <td className="p-3 whitespace-nowrap text-sm text-gray-500">{new Date(entry.created_at).toLocaleTimeString()}</td>
                           <td className="p-3 whitespace-nowrap">
                              <div className="flex gap-2">
@@ -464,6 +521,18 @@ function StaffDashboard() {
                                  className="text-xs bg-gray-100 text-gray-700 px-3 py-1 rounded hover:bg-gray-200 font-semibold"
                                >
                                  Send to Back
+                               </button>
+                               <button 
+                                 onClick={async () => {
+                                   if (!window.confirm('Are you sure you want to permanently remove this user?')) return;
+                                   try {
+                                     await axios.delete(`http://localhost:3001/api/staff/remove/${entry.id}`, { headers: { Authorization: `Bearer ${staffToken}` }});
+                                     fetchQueueData();
+                                   } catch(e) {}
+                                 }} 
+                                 className="text-xs bg-red-100 text-red-700 px-3 py-1 rounded hover:bg-red-200 font-semibold"
+                               >
+                                 Remove
                                </button>
                              </div>
                           </td>

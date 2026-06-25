@@ -50,22 +50,44 @@ async function initializeDatabase() {
     throw error;
   }
 }
-async function query(text, params) {
+async function query(text, params, tenantId = null) {
   const start = Date.now();
-  try {
-    const res = await pool.query(text, params);
-    const duration = Date.now() - start;
-    console.log('Executed query', { text, duration, rows: res.rowCount });
-    return res;
-  } catch (error) {
-    console.error('Query error:', { text, error: error.message });
-    throw error;
+  if (tenantId) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId]);
+      const res = await client.query(text, params);
+      await client.query('COMMIT');
+      const duration = Date.now() - start;
+      console.log('Executed tenant query', { text, duration, rows: res.rowCount });
+      return res;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Tenant query error:', { text, error: error.message });
+      throw error;
+    } finally {
+      client.release();
+    }
+  } else {
+    try {
+      const res = await pool.query(text, params);
+      const duration = Date.now() - start;
+      console.log('Executed query', { text, duration, rows: res.rowCount });
+      return res;
+    } catch (error) {
+      console.error('Query error:', { text, error: error.message });
+      throw error;
+    }
   }
 }
-async function transaction(queries) {
+async function transaction(queries, tenantId = null) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    if (tenantId) {
+      await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId]);
+    }
     const results = [];
     for (const { text, params } of queries) {
       const result = await client.query(text, params);

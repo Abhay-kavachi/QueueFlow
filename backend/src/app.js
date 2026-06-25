@@ -13,6 +13,7 @@ const staffRoutes = require('./routes/staff.routes');
 const analyticsRoutes = require('./routes/analytics.routes');
 const masterRoutes = require('./routes/master.routes');
 const { errorHandler } = require('./middleware/error.middleware');
+const correlationMiddleware = require('./middleware/correlation.middleware');
 const setupSocketHandlers = require('./sockets/socket.handler');
 const { initializeDatabase } = require('./utils/database');
 const QueueEngine = require('./modules/queue/queue.engine');
@@ -35,6 +36,7 @@ const limiter = rateLimit({
 app.use(limiter);
 app.use(cors());
 app.use(morgan('combined'));
+app.use(correlationMiddleware);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 const socketHandlers = setupSocketHandlers(io);

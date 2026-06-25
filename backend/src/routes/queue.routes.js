@@ -3,6 +3,8 @@ const router = express.Router();
 const QueueModel = require('../models/Queue.model');
 const AuthService = require('../services/Auth.service');
 const AuthModel = require('../models/Auth.model');
+const MLService = require('../services/ML.service');
+const AuditService = require('../services/Audit.service');
 const { authenticateUser, authenticateWorker } = require('../middleware/auth.middleware');
 router.get('/organizations', async (req, res, next) => {
   try {
@@ -77,7 +79,17 @@ router.get('/my-status', authenticateUser, async (req, res, next) => {
   try {
     const userHash = req.user.userHash;
     const queues = await QueueModel.getUserActiveQueues(userHash);
-    res.json({ success: true, queues });
+    
+    // Attach ETA to each active queue
+    const queuesWithETA = await Promise.all(queues.map(async (q) => {
+      const avgWait = await MLService.getPredictedWaitTime(q.service_id);
+      return {
+        ...q,
+        eta_minutes: Math.round(q.queue_position * avgWait)
+      };
+    }));
+
+    res.json({ success: true, queues: queuesWithETA });
   } catch (error) {
     next(error);
   }
@@ -93,6 +105,10 @@ router.get('/position/:serviceId', authenticateUser, async (req, res, next) => {
         error: 'User not found in queue'
       });
     }
+    
+    const avgWait = await MLService.getPredictedWaitTime(serviceId);
+    position.eta_minutes = Math.round(position.position * avgWait);
+
     res.json({
       success: true,
       data: position
@@ -147,8 +163,7 @@ router.post('/join/:serviceId', authenticateUser, async (req, res, next) => {
         
         const existingCountRes = await query(
           `SELECT COUNT(*) as count FROM live_queue 
-           WHERE service_id = $1 AND entry_type = 'appointment' AND appointment_time = $2
-           FOR UPDATE`,
+           WHERE service_id = $1 AND entry_type = 'appointment' AND appointment_time = $2`,
           [serviceId, time]
         );
         
@@ -160,10 +175,23 @@ router.post('/join/:serviceId', authenticateUser, async (req, res, next) => {
         const result = await QueueModel.addUserToQueue(userHash, serviceId, 'self', 'appointment', time);
         await query('COMMIT');
         
+        const avgWait = await MLService.getPredictedWaitTime(serviceId);
+        const etaMinutes = avgWait;
+
+        await AuditService.logEvent({
+          tenantId: service.organization_id,
+          userId: userHash,
+          action: 'QUEUE_JOINED',
+          entityType: 'Queue',
+          entityId: result.queueEntry.id,
+          correlationId: req.correlationId,
+          metadata: { entryType: 'appointment', appointmentTime: time }
+        });
+
         return res.status(201).json({
           success: true,
           message: 'Appointment booked successfully',
-          data: { queueId: result.queueEntry.id, position: null, appointmentTime: time }
+          data: { queueId: result.queueEntry.id, position: null, appointmentTime: time, eta_minutes: etaMinutes }
         });
       } catch (err) {
         await query('ROLLBACK');
@@ -172,10 +200,24 @@ router.post('/join/:serviceId', authenticateUser, async (req, res, next) => {
     } else {
       
       const result = await QueueModel.addUserToQueue(userHash, serviceId, 'self', 'walk_in', null);
+      
+      const avgWait = await MLService.getPredictedWaitTime(serviceId);
+      const etaMinutes = Math.round(result.queueEntry.position * avgWait);
+
+      await AuditService.logEvent({
+        tenantId: service.organization_id,
+        userId: userHash,
+        action: 'QUEUE_JOINED',
+        entityType: 'Queue',
+        entityId: result.queueEntry.id,
+        correlationId: req.correlationId,
+        metadata: { entryType: 'walk_in', position: result.queueEntry.position }
+      });
+
       return res.status(201).json({
         success: true,
         message: 'Successfully joined queue',
-        data: { queueId: result.queueEntry.id, position: result.queueEntry.position }
+        data: { queueId: result.queueEntry.id, position: result.queueEntry.position, eta_minutes: etaMinutes }
       });
     }
   } catch (error) {
@@ -202,12 +244,28 @@ router.post('/join/:serviceId/worker', authenticateWorker, async (req, res, next
       });
     }
     const result = await QueueModel.addUserToQueue(userHash, serviceId, 'worker');
+    
+    await AuditService.logEvent({
+      tenantId: service.organization_id,
+      userId: req.worker.id,
+      roleId: req.roleId,
+      action: 'QUEUE_JOINED',
+      entityType: 'Queue',
+      entityId: result.queueEntry.id,
+      correlationId: req.correlationId,
+      metadata: { entryType: 'walk_in', position: result.queueEntry.position, onBehalfOf: userHash }
+    });
+
+    const avgWait = await MLService.getPredictedWaitTime(serviceId);
+    const etaMinutes = Math.round(result.queueEntry.position * avgWait);
+
     res.status(201).json({
       success: true,
       message: 'User added to queue by worker',
       data: {
         queueId: result.queueEntry.id,
-        position: result.queueEntry.position
+        position: result.queueEntry.position,
+        eta_minutes: etaMinutes
       }
     });
   } catch (error) {
