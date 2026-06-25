@@ -20,7 +20,8 @@ router.post('/request-otp', rateLimit(5, 15 * 60 * 1000), async (req, res, next)
     res.json({
       success: true,
       message: result.message,
-      userHash: result.userHash
+      userHash: result.userHash,
+      otp: result.otp
     });
   } catch (error) {
     next(error);
@@ -35,14 +36,15 @@ router.post('/verify-otp', async (req, res, next) => {
         error: 'User hash and OTP required'
       });
     }
-    const result = await AuthService.verifyOTPAndLogin(userHash, otp, purpose);
+    const result = await AuthService.verifyOTPAndLogin(userHash, otp, purpose, req);
     if (!result.success) {
       return res.status(401).json(result);
     }
     res.json({
       success: true,
       message: result.message,
-      sessionToken: result.sessionToken
+      sessionToken: result.sessionToken,
+      refreshToken: result.refreshToken
     });
   } catch (error) {
     next(error);
@@ -57,7 +59,7 @@ router.post('/worker-verify', async (req, res, next) => {
         error: 'Identifier and worker token required'
       });
     }
-    const result = await AuthService.workerVerifyUser(identifier, workerToken);
+    const result = await AuthService.workerVerifyUser(identifier, workerToken, req);
     if (!result.success) {
       return res.status(401).json(result);
     }
@@ -88,7 +90,7 @@ router.post('/logout', async (req, res, next) => {
         error: 'Invalid session'
       });
     }
-    const result = await AuthService.logout(verificationResult.sessionId);
+    const result = await AuthService.logout(verificationResult.sessionId, req);
     res.json(result);
   } catch (error) {
     next(error);
@@ -103,7 +105,7 @@ router.post('/staff/login', rateLimit(10, 15 * 60 * 1000), async (req, res, next
         error: 'Username and password required'
       });
     }
-    const result = await AuthService.adminLogin(username, password);
+    const result = await AuthService.adminLogin(username, password, req);
     if (!result.success) {
       return res.status(401).json(result);
     }

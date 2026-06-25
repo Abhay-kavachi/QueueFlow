@@ -7,6 +7,8 @@ const QueueModel = require('../models/Queue.model');
 const AuthModel = require('../models/Auth.model');
 const { query } = require('../utils/database');
 const { authenticateStaff } = require('../middleware/auth.middleware');
+const { authorizeTransition } = require('../middleware/rbac.middleware');
+const AuditService = require('../services/Audit.service');
 const bcrypt = require('bcryptjs');
 
 
@@ -26,7 +28,7 @@ const verifyTenantAccess = async (req, res, next) => {
       match: String(result.rows[0].organization_id) === String(req.staff.organizationId)
     });
 
-    if (String(result.rows[0].organization_id) !== String(req.staff.organizationId)) {
+    if (req.staff.role !== 'admin' && req.staff.role !== 'master' && String(result.rows[0].organization_id) !== String(req.staff.organizationId)) {
       return res.status(403).json({ success: false, error: 'Unauthorized: Multi-tenant DB boundary violation' });
     }
 
@@ -60,34 +62,47 @@ router.get('/dashboard/:serviceId', authenticateStaff, verifyTenantAccess, async
 });
 router.post('/create-account', authenticateStaff, async (req, res, next) => {
   try {
-    if (req.staff.role !== 'admin') {
+    if (req.staff.role !== 'admin' && req.staff.role !== 'ORG_ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Only administrators can create new staff accounts'
       });
     }
+    
+    // Mass Assignment Protection: explicitly destructure only allowed fields
     const { username, password, role } = req.body;
+    
     if (!username || !password) {
       return res.status(400).json({
         success: false,
         error: 'Username and password are required'
       });
     }
-    if (role && !['admin', 'worker'].includes(role)) {
+    
+    // Ensure role assignment is strictly controlled
+    const allowedRoles = ['worker', 'DOCTOR', 'RECEPTIONIST', 'LAB_TECHNICIAN'];
+    if (role && !allowedRoles.includes(role)) {
       return res.status(400).json({
         success: false,
-        error: 'Role must be either admin or worker'
+        error: 'Invalid or unauthorized role assignment'
       });
     }
+    
     const result = await AuthModel.createAdminUser(
       username, 
       password, 
       role || 'worker', 
       req.staff.adminId
     );
+    
     if (!result.success) {
       return res.status(400).json(result);
     }
+    
+    await AuditService.logEvent({
+      tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'WORKER_CREATED', entityType: 'Worker', entityId: result.admin.id, correlationId: req.correlationId, metadata: { role }
+    });
+
     res.status(201).json({
       success: true,
       message: 'Staff account created successfully',
@@ -116,24 +131,47 @@ router.get('/accounts', authenticateStaff, async (req, res, next) => {
 });
 router.put('/accounts/:adminId', authenticateStaff, async (req, res, next) => {
   try {
-    if (req.staff.role !== 'admin') {
+    if (req.staff.role !== 'admin' && req.staff.role !== 'ORG_ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Only administrators can update staff accounts'
       });
     }
     const { adminId } = req.params;
-    const updates = req.body;
+    
+    // Mass Assignment Protection: explicitly destructure only allowed fields
+    const { role, is_active } = req.body;
+    const updates = {};
+    if (role !== undefined) updates.role = role;
+    if (is_active !== undefined) updates.is_active = is_active;
+    
     if (adminId === req.staff.adminId && updates.role) {
       return res.status(400).json({
         success: false,
         error: 'Cannot change your own role'
       });
     }
+    
+    // Validate role escalation
+    const allowedRoles = ['worker', 'DOCTOR', 'RECEPTIONIST', 'LAB_TECHNICIAN'];
+    if (updates.role && !allowedRoles.includes(updates.role)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid or unauthorized role assignment'
+      });
+    }
+    
     const result = await AuthModel.updateAdminUser(adminId, updates);
     if (!result.success) {
       return res.status(404).json(result);
     }
+    
+    if (updates.role) {
+      await AuditService.logEvent({
+        tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'ROLE_CHANGED', entityType: 'Worker', entityId: adminId, correlationId: req.correlationId, metadata: { role: updates.role }
+      });
+    }
+    
     res.json({
       success: true,
       message: 'Staff account updated successfully',
@@ -145,7 +183,7 @@ router.put('/accounts/:adminId', authenticateStaff, async (req, res, next) => {
 });
 router.delete('/accounts/:adminId', authenticateStaff, async (req, res, next) => {
   try {
-    if (req.staff.role !== 'admin') {
+    if (req.staff.role !== 'admin' && req.staff.role !== 'ORG_ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Only administrators can delete staff accounts'
@@ -162,6 +200,11 @@ router.delete('/accounts/:adminId', authenticateStaff, async (req, res, next) =>
     if (!result.success) {
       return res.status(400).json(result);
     }
+    
+    await AuditService.logEvent({
+      tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'WORKER_REMOVED', entityType: 'Worker', entityId: adminId, correlationId: req.correlationId, metadata: {}
+    });
+    
     res.json({
       success: true,
       message: 'Staff account deleted successfully',
@@ -171,7 +214,26 @@ router.delete('/accounts/:adminId', authenticateStaff, async (req, res, next) =>
     next(error);
   }
 });
-router.post('/complete/:serviceId', authenticateStaff, verifyTenantAccess, async (req, res, next) => {
+
+router.post('/mark-active/:serviceId', authenticateStaff, verifyTenantAccess, authorizeTransition('active'), async (req, res, next) => {
+  try {
+    const { serviceId } = req.params;
+    const nextPerson = await QueueModel.markPatientActive(serviceId);
+    if (!nextPerson) {
+      return res.status(400).json({ error: 'No patient is currently called' });
+    }
+    await AuditService.logEvent({
+      tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'STATE_TRANSITION', entityType: 'Queue', entityId: nextPerson.id, correlationId: req.correlationId, metadata: { state: 'active' }
+    });
+    const io = req.app.get('io');
+    if (io) io.to(serviceId.toString()).emit('queue:update');
+    res.json({ message: 'Patient marked as active in examination', nextPerson });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/complete/:serviceId', authenticateStaff, verifyTenantAccess, authorizeTransition('completed'), async (req, res, next) => {
   try {
     const { serviceId } = req.params;
     const result = await QueueModel.completeServiceCurrent(serviceId);
@@ -181,6 +243,9 @@ router.post('/complete/:serviceId', authenticateStaff, verifyTenantAccess, async
         error: 'No active service found'
       });
     }
+    await AuditService.logEvent({
+      tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'STATE_TRANSITION', entityType: 'Queue', entityId: result.id, correlationId: req.correlationId, metadata: { state: 'completed' }
+    });
     res.json({
       success: true,
       message: 'Service completed successfully',
@@ -190,23 +255,29 @@ router.post('/complete/:serviceId', authenticateStaff, verifyTenantAccess, async
     next(error);
   }
 });
-router.post('/call-next/:serviceId', authenticateStaff, verifyTenantAccess, async (req, res, next) => {
+router.post('/call-next/:serviceId', authenticateStaff, verifyTenantAccess, authorizeTransition('next'), async (req, res, next) => {
   try {
     const { serviceId } = req.params;
     const result = await QueueModel.callNextCurrent(serviceId);
     if (!result) {
       return res.status(404).json({ success: false, error: 'No pending users in queue' });
     }
+    await AuditService.logEvent({
+      tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'STATE_TRANSITION', entityType: 'Queue', entityId: result.id, correlationId: req.correlationId, metadata: { state: 'next' }
+    });
     res.json({ success: true, message: 'Next user called', data: result });
   } catch (error) { next(error); }
 });
-router.post('/no-show/:serviceId', authenticateStaff, verifyTenantAccess, async (req, res, next) => {
+router.post('/no-show/:serviceId', authenticateStaff, verifyTenantAccess, authorizeTransition('grace'), async (req, res, next) => {
   try {
     const { serviceId } = req.params;
     const result = await QueueModel.setNoShowCurrent(serviceId);
     if (!result) {
       return res.status(404).json({ success: false, error: 'No active user found to mark as no-show' });
     }
+    await AuditService.logEvent({
+      tenantId: req.tenantId, userId: req.staff.id, roleId: req.roleId, action: 'STATE_TRANSITION', entityType: 'Queue', entityId: result.id, correlationId: req.correlationId, metadata: { state: 'grace' }
+    });
     res.json({ success: true, message: 'User moved to grace period', data: result });
   } catch (error) { next(error); }
 });
@@ -216,7 +287,7 @@ router.post('/reinstate/:queueId', authenticateStaff, async (req, res, next) => 
     const { queueId } = req.params;
     const queueEntry = await QueueModel.query('SELECT organization_id, service_id FROM live_queue WHERE id = $1', [queueId]);
     if (queueEntry.rows.length === 0) return res.status(404).json({ success: false, error: 'Queue entry not found' });
-    if (String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+    if (req.staff.role !== 'admin' && req.staff.role !== 'master' && String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) return res.status(403).json({ success: false, error: 'Unauthorized: Multi-tenant DB boundary violation' });
     if (req.staff.role === 'worker' && String(queueEntry.rows[0].service_id) !== String(req.staff.serviceId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
     const result = await QueueModel.reinstateFromGrace(queueId);
@@ -229,7 +300,7 @@ router.post('/send-to-back/:queueId', authenticateStaff, async (req, res, next) 
     const { queueId } = req.params;
     const queueEntry = await QueueModel.query('SELECT organization_id, service_id FROM live_queue WHERE id = $1', [queueId]);
     if (queueEntry.rows.length === 0) return res.status(404).json({ success: false, error: 'Queue entry not found' });
-    if (String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
+    if (req.staff.role !== 'admin' && req.staff.role !== 'master' && String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) return res.status(403).json({ success: false, error: 'Unauthorized: Multi-tenant DB boundary violation' });
     if (req.staff.role === 'worker' && String(queueEntry.rows[0].service_id) !== String(req.staff.serviceId)) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
     const result = await QueueModel.sendToBack(queueId);
@@ -290,7 +361,7 @@ router.post('/complete-manual/:queueId', authenticateStaff, async (req, res, nex
         error: 'Queue entry not found'
       });
     }
-    if (String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) {
+    if (req.staff.role !== 'admin' && req.staff.role !== 'master' && String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) {
       return res.status(403).json({ success: false, error: 'Unauthorized: Multi-tenant DB boundary violation' });
     }
     if (req.staff.role === 'worker' && String(queueEntry.rows[0].service_id) !== String(req.staff.serviceId)) {
@@ -320,7 +391,7 @@ router.post('/grace/:queueId', authenticateStaff, async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Queue entry not found' });
     }
     
-    if (String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) {
+    if (req.staff.role !== 'admin' && req.staff.role !== 'master' && String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) {
       return res.status(403).json({ success: false, error: 'Unauthorized: Multi-tenant DB boundary violation' });
     }
     if (req.staff.role === 'worker' && String(queueEntry.rows[0].service_id) !== String(req.staff.serviceId)) {
@@ -330,21 +401,64 @@ router.post('/grace/:queueId', authenticateStaff, async (req, res, next) => {
     res.json({ success: true, message: 'User moved to grace queue', data: result });
   } catch (error) { next(error); }
 });
+
+router.delete('/remove/:queueId', authenticateStaff, async (req, res, next) => {
+  try {
+    const { queueId } = req.params;
+    const queueEntry = await QueueModel.query(
+      'SELECT id, organization_id, service_id, state FROM live_queue WHERE id = $1',
+      [queueId]
+    );
+    if (queueEntry.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Queue entry not found' });
+    }
+    
+    if (req.staff.role !== 'admin' && req.staff.role !== 'master' && String(queueEntry.rows[0].organization_id) !== String(req.staff.organizationId)) {
+      return res.status(403).json({ success: false, error: 'Unauthorized: Multi-tenant DB boundary violation' });
+    }
+    if (req.staff.role === 'worker' && String(queueEntry.rows[0].service_id) !== String(req.staff.serviceId)) {
+      return res.status(403).json({ success: false, error: 'Unauthorized: You can only modify your assigned service queue' });
+    }
+    
+    const result = await QueueModel.removeUserFromQueue(queueId);
+    
+    // Notify clients about the change
+    const io = req.app.get('io');
+    if (io && result.success && result.removed) {
+      io.to(queueEntry.rows[0].service_id.toString()).emit('queue:update');
+    }
+
+    res.json({ success: true, message: 'User successfully removed from the queue', data: result });
+  } catch (error) { next(error); }
+});
 router.get('/queue/:serviceId', authenticateStaff, verifyTenantAccess, async (req, res, next) => {
   try {
     const { serviceId } = req.params;
     const { state } = req.query; 
-    let queryText = 'SELECT * FROM live_queue WHERE service_id = $1';
+    let queryText = `
+      SELECT lq.*, u.full_name as user_name, u.identifier as user_identifier, u.phone as user_phone
+      FROM live_queue lq
+      LEFT JOIN users u ON encode(digest(u.identifier, 'sha256'), 'hex') = lq.user_hash
+      WHERE lq.service_id = $1
+    `;
     let queryParams = [serviceId];
     if (state) {
-      queryText += ' AND state = $2';
+      queryText += ' AND lq.state = $2';
       queryParams.push(state);
     }
-    queryText += ' ORDER BY position ASC';
+    queryText += ' ORDER BY lq.position ASC';
     const result = await QueueModel.query(queryText, queryParams);
+    
+    const { maskIdentifier } = require('../utils/masking');
+    const maskedData = result.rows.map(row => ({
+      ...row,
+      user_identifier: maskIdentifier(row.user_identifier),
+      user_phone: maskIdentifier(row.user_phone)
+    }));
+
     res.json({
       success: true,
-      data: result.rows
+      data: maskedData
     });
   } catch (error) {
     next(error);
@@ -469,8 +583,8 @@ router.post('/bulk-queue-inject/:serviceId', authenticateStaff, verifyTenantAcce
     let failed = 0;
     let errors = [];
 
-    const idAliases = ['aadhaar', 'aadhaar_number', 'aadhar', 'student_id', 'studentid', 'enrollment_id', 'mobile', 'mobile_number', 'phone'];
-    const nameAliases = ['name', 'full_name'];
+    const idAliases = ['aadhaar', 'aadhaar_number', 'aadhaar number', 'aadhar', 'aadhar number', 'student_id', 'student id', 'studentid', 'enrollment_id', 'enrollment id', 'mobile', 'mobile_number', 'mobile number', 'phone', 'phone number'];
+    const nameAliases = ['name', 'full_name', 'full name', 'patient name', 'student name'];
 
     for (let i = 0; i < results.length; i++) {
       const rawRow = results[i];
@@ -526,8 +640,16 @@ router.post('/bulk-queue-inject/:serviceId', authenticateStaff, verifyTenantAcce
     
     try { fs.unlinkSync(req.file.path); } catch(e){}
     
+    if (injected > 0) {
+      const io = req.app.get('io');
+      if (io) {
+        io.to(serviceId.toString()).emit('queue:update');
+      }
+    }
+    
     res.json({
       success: true,
+      message: `Successfully injected ${injected} users. Failed: ${failed}. Reasons: ${[...new Set(errors.map(e => e.reason))].join(', ')}`,
       injected,
       failed,
       errors

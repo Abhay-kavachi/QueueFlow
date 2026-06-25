@@ -47,7 +47,7 @@ def fetch_wait_time_data(service_id, days=None):
             DATE(completed_at) as date,
             AVG(actual_wait_duration) as avg_wait_time,
             COUNT(*) as total_completed
-        FROM queue_records 
+        FROM historical_queue_logs 
         WHERE service_id = %s 
         AND completed_at >= CURRENT_DATE - INTERVAL '%s days'
         AND final_status = 'completed'
@@ -93,7 +93,7 @@ def get_service_statistics(service_id):
             MAX(actual_wait_duration) as max_wait_time,
             COUNT(CASE WHEN final_status = 'completed' THEN 1 END) as completed_visits,
             COUNT(CASE WHEN final_status = 'expired' THEN 1 END) as expired_visits
-        FROM queue_records 
+        FROM historical_queue_logs 
         WHERE service_id = %s
         """
         stats_df = pd.read_sql_query(stats_query, conn, params=[service_id])
@@ -112,7 +112,7 @@ def get_service_statistics(service_id):
             EXTRACT(HOUR FROM completed_at) as hour,
             COUNT(*) as visits,
             AVG(actual_wait_duration) as avg_hourly_wait
-        FROM queue_records 
+        FROM historical_queue_logs 
         WHERE service_id = %s AND final_status = 'completed'
         GROUP BY EXTRACT(HOUR FROM completed_at)
         ORDER BY hour

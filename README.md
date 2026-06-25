@@ -61,7 +61,13 @@ python app.py
 - **Backend Hub**: http://localhost:3000
 - **AI Forecasting Engine**: http://localhost:5000
 
-## Architecture Security
+## Architecture Security & Concurrency
+
+**Concurrency & Resource Locking:**
+To prevent race conditions during high-volume queue operations (e.g., two doctors clicking "Call Next Patient" at the exact same millisecond), the `QueueModel` employs strict row-level `SELECT ... FOR UPDATE` locks natively within PostgreSQL transactions.
+1. **Queue Advancement (`callNextCurrent`)**: Explicitly locks the top `pending` row to guarantee only one worker claims the patient.
+2. **Patient Activation (`moveQueueForward`)**: Locks the `next` user row to avoid state-transition races.
+3. **Grace Expiration**: Locks the `grace` user to prevent a worker from reinstating a patient exactly as the automated job expires them.
 
 **Minimum Viable Security (MVS) Checks Installed:**
 1. **Rate Limiting**: Globally locked to 50 max hits to halt API floods, with a specialized sub-ceiling of 5 max hits for the `/api/auth` login endpoint preventing expensive SMS spam outcries.

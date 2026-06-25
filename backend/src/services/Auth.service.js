@@ -31,10 +31,21 @@ class AuthService {
       const otp = AuthModel.generateOTP();
       await AuthModel.storeOTP(userHash, otp, purpose);
       console.log(`OTP for ${identifier}: ${otp}`); 
+      const AuditService = require('./Audit.service');
+      await AuditService.logEvent({
+        tenantId: '00000000-0000-0000-0000-000000000000', // Global action
+        userId: userHash,
+        action: 'OTP_REQUESTED',
+        entityType: 'User',
+        entityId: userHash,
+        metadata: { purpose }
+      });
+
       return {
         success: true,
         message: 'OTP sent successfully',
-        userHash 
+        userHash,
+        otp: process.env.DEMO_MODE === 'true' ? otp : undefined
       };
     } catch (error) {
       console.error('OTP request error:', error);
@@ -44,19 +55,52 @@ class AuthService {
       };
     }
   }
-  static async verifyOTPAndLogin(userHash, otp, purpose = 'checkin') {
+  static async verifyOTPAndLogin(userHash, otp, purpose = 'checkin', req = {}) {
+    const AuditService = require('./Audit.service');
     try {
       const verificationResult = await AuthModel.verifyOTP(userHash, otp, purpose);
       if (!verificationResult.valid) {
+        await AuditService.logEvent({
+          tenantId: '00000000-0000-0000-0000-000000000000',
+          userId: userHash,
+          action: 'LOGIN_FAILED',
+          entityType: 'User',
+          entityId: userHash,
+          correlationId: req.correlationId,
+          metadata: { reason: verificationResult.reason }
+        });
         return {
           success: false,
           error: verificationResult.reason
         };
       }
+      
+      await AuditService.logEvent({
+        tenantId: '00000000-0000-0000-0000-000000000000',
+        userId: userHash,
+        action: 'OTP_VERIFIED',
+        entityType: 'User',
+        entityId: userHash,
+        correlationId: req.correlationId,
+        metadata: { purpose }
+      });
+
       const sessionResult = await AuthModel.createUserSession(userHash);
+      
+      await AuditService.logEvent({
+        tenantId: '00000000-0000-0000-0000-000000000000',
+        userId: userHash,
+        action: 'SESSION_CREATED',
+        entityType: 'Session',
+        entityId: sessionResult.sessionId,
+        correlationId: req.correlationId,
+        metadata: {}
+      });
+
       return {
         success: true,
         sessionToken: sessionResult.sessionToken,
+        refreshToken: sessionResult.refreshToken,
         message: 'Login successful'
       };
     } catch (error) {
@@ -88,17 +132,39 @@ class AuthService {
       };
     }
   }
-  static async logout(sessionId) {
+  static async logout(sessionId, req = {}) {
     try {
-      await AuthModel.invalidateSession(sessionId);
+      await AuthModel.revokeSession(sessionId);
+      const AuditService = require('./Audit.service');
+      await AuditService.logEvent({
+        tenantId: '00000000-0000-0000-0000-000000000000',
+        userId: 'system',
+        action: 'SESSION_REVOKED',
+        entityType: 'Session',
+        entityId: sessionId,
+        correlationId: req.correlationId,
+        metadata: {}
+      });
       return { success: true, message: 'Logged out successfully' };
     } catch (error) {
       return { success: false, error: 'Logout failed' };
     }
   }
-  static async adminLogin(username, password) {
+  static async adminLogin(username, password, req = {}) {
+    const AuditService = require('./Audit.service');
     try {
       const result = await AuthModel.authenticateAdmin(username, password);
+      if (!result.success) {
+        await AuditService.logEvent({
+          tenantId: '00000000-0000-0000-0000-000000000000',
+          userId: username,
+          action: 'LOGIN_FAILED',
+          entityType: 'Staff',
+          entityId: username,
+          correlationId: req.correlationId,
+          metadata: { reason: result.error }
+        });
+      }
       return result;
     } catch (error) {
       console.error('Admin login error:', error);
@@ -128,10 +194,20 @@ class AuthService {
       };
     }
   }
-  static async workerVerifyUser(identifier, workerToken) {
+  static async workerVerifyUser(identifier, workerToken, req = {}) {
     try {
       const adminVerification = await this.verifyAdminToken(workerToken);
+      const AuditService = require('./Audit.service');
       if (!adminVerification.valid) {
+        await AuditService.logEvent({
+          tenantId: '00000000-0000-0000-0000-000000000000',
+          userId: identifier,
+          action: 'LOGIN_FAILED',
+          entityType: 'User',
+          entityId: identifier,
+          correlationId: req.correlationId,
+          metadata: { reason: 'Unauthorized worker access' }
+        });
         return {
           success: false,
           error: 'Unauthorized worker access'
@@ -139,9 +215,21 @@ class AuthService {
       }
       const userHash = AuthModel.hashIdentifier(identifier);
       const sessionResult = await AuthModel.createUserSession(userHash);
+      
+      await AuditService.logEvent({
+        tenantId: '00000000-0000-0000-0000-000000000000',
+        userId: userHash,
+        action: 'SESSION_CREATED',
+        entityType: 'Session',
+        entityId: sessionResult.sessionId,
+        correlationId: req.correlationId,
+        metadata: { createdByWorker: adminVerification.admin.id }
+      });
+
       return {
         success: true,
         sessionToken: sessionResult.sessionToken,
+        refreshToken: sessionResult.refreshToken,
         userHash,
         message: 'Worker verification successful'
       };

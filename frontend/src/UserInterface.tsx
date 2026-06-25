@@ -24,6 +24,7 @@ interface QueueEntry {
   state: 'pending' | 'next' | 'active' | 'grace' | 'appointment' | 'skipped' | 'completed' | 'expired';
   entryType?: 'walk_in' | 'appointment';
   appointmentTime?: string;
+  etaMinutes?: number;
 }
 
 interface TimeSlot {
@@ -52,6 +53,7 @@ function UserInterface() {
   const [joinMode, setJoinMode] = useState<'walk_in' | 'appointment'>('walk_in');
   const [timeSlots, setTimeSlots] = useState<TimeSlot[]>([]);
   const [selectedTimeSlot, setSelectedTimeSlot] = useState<string>('');
+  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
   
   const [queuePosition, setQueuePosition] = useState<QueueEntry | null>(null);
   const [myQueues, setMyQueues] = useState<any[]>([]);
@@ -155,6 +157,16 @@ function UserInterface() {
     }
   }, [step, orgId, selectedService]);
 
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (step === 'queue' && queuePosition?.etaMinutes !== undefined && queuePosition.etaMinutes > 1) {
+      interval = setInterval(() => {
+        setQueuePosition(prev => prev ? { ...prev, etaMinutes: prev.etaMinutes! - 1 } : null);
+      }, 60000);
+    }
+    return () => clearInterval(interval);
+  }, [step, queuePosition?.etaMinutes]);
+
   const selectOrg = (id: string, mode: string) => {
     setOrgId(id);
     setAuthMode(mode);
@@ -172,7 +184,11 @@ function UserInterface() {
       const res = await axios.post('http://localhost:3001/api/auth/request-otp', { identifier, purpose: 'checkin' });
       setUserHash(res.data.userHash);
       setStep('otp');
-      setMessage('OTP generated. (If DEMO_MODE=true, enter 123456. Otherwise check backend console.)');
+      if (res.data.otp) {
+        setMessage(`OTP generated. Demo OTP: ${res.data.otp}`);
+      } else {
+        setMessage('OTP generated. Check your messages/console.');
+      }
     } catch (err: any) {
       setMessage(err.response?.data?.error || 'Failed to request OTP');
     } finally {
@@ -230,7 +246,8 @@ function UserInterface() {
         position: res.data.data.position,
         state: joinMode === 'appointment' ? 'appointment' : 'pending',
         entryType: joinMode,
-        appointmentTime: joinMode === 'appointment' ? selectedTimeSlot : undefined
+        appointmentTime: joinMode === 'appointment' ? selectedTimeSlot : undefined,
+        etaMinutes: res.data.data.eta_minutes
       });
       setStep('queue');
       setMessage('Successfully joined the queue!');
@@ -279,7 +296,7 @@ function UserInterface() {
     );
   }
 
-const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string }) => {
+const AppointmentCountdown = ({ appointmentTime, etaMinutes }: { appointmentTime?: string, etaMinutes?: number }) => {
   const [timeLeft, setTimeLeft] = useState<string>('');
   
   useEffect(() => {
@@ -305,6 +322,11 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
         {appointmentTime ? new Date(appointmentTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
       </h2>
       <p className="text-lg font-semibold text-blue-800">{timeLeft}</p>
+      {etaMinutes !== undefined && (
+        <div className="mt-4 inline-block bg-white px-4 py-2 rounded-xl shadow-sm border border-gray-100 text-sm font-semibold text-gray-500">
+          ⏳ Estimated Delay: <span className="font-bold text-gray-700 text-base">~{etaMinutes} mins</span>
+        </div>
+      )}
     </>
   );
 };
@@ -435,7 +457,8 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
                           position: q.queue_position,
                           state: q.state,
                           entryType: q.entry_type,
-                          appointmentTime: q.appointment_time
+                          appointmentTime: q.appointment_time,
+                          etaMinutes: q.eta_minutes
                         });
                         localStorage.setItem('serviceId', q.service_id.toString());
                         setStep('queue');
@@ -446,8 +469,15 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
                         <span className="font-bold text-blue-900">{q.service_name}</span>
                         <span className="text-xs font-bold px-2 py-1 bg-white text-blue-700 rounded-full shadow-sm uppercase">{q.state}</span>
                       </div>
-                      <div className="text-sm text-blue-700 font-medium">
-                        {q.entry_type === 'walk_in' ? `Queue Position: ${q.queue_position}` : `Appointment: ${new Date(q.appointment_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}
+                      <div className="flex justify-between items-center text-sm font-medium mt-1">
+                        <span className="text-blue-700">
+                          {q.entry_type === 'walk_in' ? `Queue Position: ${q.queue_position}` : `Appointment: ${new Date(q.appointment_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}
+                        </span>
+                        {q.eta_minutes !== undefined && q.state !== 'active' && (
+                          <span className="text-gray-600 bg-white px-2 py-0.5 rounded-md border border-gray-100 shadow-sm text-xs flex items-center gap-1">
+                            ⏳ {q.entry_type === 'appointment' ? 'Est. Delay' : 'Est. Wait'}: ~{q.eta_minutes} mins
+                          </span>
+                        )}
                       </div>
                     </button>
                   ))}
@@ -506,8 +536,7 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
                     onClick={async () => {
                       setJoinMode('appointment');
                       try {
-                        const date = new Date().toISOString().split('T')[0];
-                        const res = await axios.get('http://localhost:3001/api/queue/services/' + selectedService + '/slots?date=' + date, {
+                        const res = await axios.get(`http://localhost:3001/api/queue/slots/${selectedService}?date=${selectedDate}`, {
                           headers: { Authorization: `Bearer ${sessionToken}` }
                         });
                         setTimeSlots(res.data.slots);
@@ -520,7 +549,28 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
                 </div>
                 
                 {joinMode === 'appointment' && (
-                  <div className="grid grid-cols-3 gap-2 max-h-48 overflow-y-auto p-2">
+                  <>
+                    <div className="mb-4 px-2">
+                      <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Select Date</label>
+                      <input 
+                        type="date" 
+                        value={selectedDate}
+                        min={new Date().toISOString().split('T')[0]}
+                        onChange={async (e) => {
+                          const newDate = e.target.value;
+                          setSelectedDate(newDate);
+                          try {
+                            const res = await axios.get(`http://localhost:3001/api/queue/slots/${selectedService}?date=${newDate}`, {
+                              headers: { Authorization: `Bearer ${sessionToken}` }
+                            });
+                            setTimeSlots(res.data.slots);
+                            setSelectedTimeSlot('');
+                          } catch (err) {}
+                        }}
+                        className="w-full p-2 border border-gray-300 rounded-lg text-sm focus:ring-purple-500 focus:border-purple-500"
+                      />
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 max-h-48 overflow-y-auto p-2">
                     {timeSlots.map((slot, i) => (
                       <button
                         key={i}
@@ -533,6 +583,7 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
                     ))}
                     {timeSlots.length === 0 && <p className="col-span-3 text-center text-xs text-gray-500">Loading slots...</p>}
                   </div>
+                  </>
                 )}
               </div>
             )}
@@ -570,11 +621,11 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
               Back to Dashboard
             </button>
-            <div className={'p-8 rounded-3xl relative overflow-hidden text-center shadow-lg transition-colors duration-500 ' + (queuePosition?.state === 'active' ? 'bg-green-50 border-2 border-green-400' : queuePosition?.state === 'grace' ? 'bg-red-600 border-2 border-red-700' : 'bg-blue-50 border-2 border-blue-200')}>
+            <div className={'p-8 rounded-3xl relative overflow-hidden text-center shadow-lg transition-colors duration-500 ' + (queuePosition?.state === 'active' ? 'bg-green-50 border-2 border-green-400' : queuePosition?.state === 'grace' ? 'bg-red-600 border-2 border-red-700' : (queuePosition?.state === 'pending' && queuePosition?.position <= 3) ? 'bg-yellow-50 border-2 border-yellow-400' : 'bg-blue-50 border-2 border-blue-200')}>
                <div className="absolute top-4 right-4">
                  <span className="flex h-4 w-4 relative">
-                   <span className={'animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ' + (queuePosition?.state === 'active' ? 'bg-green-500' : queuePosition?.state === 'grace' ? 'bg-white' : 'bg-blue-500')}></span>
-                   <span className={'relative inline-flex rounded-full h-4 w-4 ' + (queuePosition?.state === 'active' ? 'bg-green-600' : queuePosition?.state === 'grace' ? 'bg-red-100' : 'bg-blue-600')}></span>
+                   <span className={'animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ' + (queuePosition?.state === 'active' ? 'bg-green-500' : queuePosition?.state === 'grace' ? 'bg-white' : (queuePosition?.state === 'pending' && queuePosition?.position <= 3) ? 'bg-yellow-500' : 'bg-blue-500')}></span>
+                   <span className={'relative inline-flex rounded-full h-4 w-4 ' + (queuePosition?.state === 'active' ? 'bg-green-600' : queuePosition?.state === 'grace' ? 'bg-red-100' : (queuePosition?.state === 'pending' && queuePosition?.position <= 3) ? 'bg-yellow-600' : 'bg-blue-600')}></span>
                  </span>
                </div>
                              {queuePosition?.state === 'grace' ? (
@@ -584,18 +635,28 @@ const AppointmentCountdown = ({ appointmentTime }: { appointmentTime?: string })
                    <p className="text-sm opacity-90 font-medium">Position expires in 5 minutes.</p>
                  </div>
                  ) : queuePosition?.entryType === 'appointment' ? (
-                  <AppointmentCountdown appointmentTime={queuePosition.appointmentTime} />
+                  <AppointmentCountdown appointmentTime={queuePosition.appointmentTime} etaMinutes={queuePosition.etaMinutes} />
                 ) : (
                  <>
                    <p className="text-gray-500 font-bold tracking-widest uppercase text-xs mb-2">Your Position</p>
                    <h2 className="text-7xl font-black text-gray-900 my-4 tracking-tighter">#{queuePosition?.position}</h2>
                     <div className="inline-block px-4 py-1 rounded-full bg-white shadow-sm mt-2">
-                      <p className={'text-sm font-extrabold uppercase tracking-widest ' + (queuePosition?.state === 'active' ? 'text-green-600' : 'text-blue-600')}>
+                      <p className={'text-sm font-extrabold uppercase tracking-widest ' + (queuePosition?.state === 'active' ? 'text-green-600' : (queuePosition?.state === 'pending' && queuePosition?.position <= 3) ? 'text-yellow-600' : 'text-blue-600')}>
                         {queuePosition?.state}
                       </p>
                     </div>
-                                      {queuePosition?.state === 'pending' && (
-                      <p className="text-sm text-gray-500 mt-6 font-medium">Approximate wait: <span className="font-bold text-gray-700">~{(queuePosition?.position || 0) * 5} mins</span></p>
+                    
+                    {queuePosition?.state === 'pending' && queuePosition?.position <= 3 && (
+                      <div className="mt-6 p-4 bg-yellow-400 text-yellow-900 rounded-xl font-black shadow-md border border-yellow-500 animate-pulse">
+                        <span className="block text-2xl mb-1">⚠️ Almost There!</span>
+                        <span className="text-sm font-semibold opacity-90">Please proceed near the counter.</span>
+                      </div>
+                    )}
+
+                    {queuePosition?.state === 'pending' && queuePosition?.etaMinutes !== undefined && (
+                      <div className="mt-4 inline-block bg-white px-4 py-2 rounded-xl shadow-sm border border-gray-100 text-sm font-semibold text-gray-500">
+                        ⏳ Estimated Wait Time: <span className="font-bold text-gray-700 text-base">~{queuePosition.etaMinutes} mins</span>
+                      </div>
                     )}
                  </>
                )}

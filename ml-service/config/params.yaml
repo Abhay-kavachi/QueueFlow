@@ -7,4 +7,4 @@ database:
 model:
   default_days_history: 30
   prediction_periods: 7
-mock_mode: true
+mock_mode: false
